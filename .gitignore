@@ -1,0 +1,24 @@
+# ESP-IDF build output (any project, any depth)
+**/build/
+**/sdkconfig
+**/sdkconfig.old
+**/dependencies.lock
+**/managed_components/
+
+# Bitstream and binary artifacts
+*.bit
+*.bin
+*.svf
+*.cfg
+
+# Yosys / nextpnr intermediates
+*.blif
+*.json
+*.asc
+*.pnr
+
+# Verilator simulation output
+**/obj_dir/
+
+# Downloaded/vendored bitstreams (too large for git, source from emard/ulx3s-bin)
+**/passthru/
