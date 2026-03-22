@@ -1,44 +1,177 @@
-# ULX3S Toolchain Dockerfile
-# Fetches the install script from the ULX3S toolchain repository and runs it
-# to set up the environment.
-# See https://github.com/ulx3s/ulx3s-toolchain
+# ============================================================
+# ULX3S ECP5-12K FPGA + ESP32 Toolchain
+# Tools: Yosys · nextpnr-ecp5 · openFPGALoader · Verilator
+#        ESP-IDF · esptool.py
+# HDL:   Verilog / SystemVerilog
+# ============================================================
 
 FROM ubuntu:22.04
 
-# Set timezone to avoid tzdata prompts
-ENV TZ=Etc/UTC
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
 
-# Install base dependencies for the install.sh script
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    sudo \
-    git \
-    curl \
-    wget \
-    ca-certificates \
-    build-essential \
+# ------------------------------------------------------------
+# System dependencies
+# ------------------------------------------------------------
+RUN apt-get update && apt-get install -y \
+    # Build essentials
+    build-essential clang cmake git wget curl pkg-config \
+    # Yosys deps
+    bison flex libreadline-dev gawk tcl-dev libffi-dev \
+    graphviz xdot python3 python3-dev python3-pip \
+    libboost-all-dev zlib1g-dev \
+    # nextpnr deps
+    libeigen3-dev \
+    # openFPGALoader deps
+    libftdi1-2 libftdi1-dev libhidapi-libusb0 libhidapi-dev \
+    libudev-dev libusb-1.0-0-dev \
+    # Verilator deps
+    perl help2man \
+    # ESP-IDF deps
+    python3-venv ninja-build ccache dfu-util \
+    libusb-1.0-0 libssl-dev \
+    # Useful extras
+    make udev ca-certificates \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# nextpnr requires CMake ≥ 3.25; Ubuntu 22.04 ships 3.22.1
+RUN pip3 install cmake
+
+WORKDIR /build
+
+# ------------------------------------------------------------
+# 1. Project Trellis  (ECP5 database — required by nextpnr)
+# ------------------------------------------------------------
+RUN git clone --depth 1 --recurse-submodules \
+        https://github.com/YosysHQ/prjtrellis.git && \
+    cd prjtrellis/libtrellis && \
+    cmake -DCMAKE_INSTALL_PREFIX=/usr/local . && \
+    make -j$(nproc) && \
+    make install
+
+# ------------------------------------------------------------
+# 2. Yosys  (synthesis)
+# ------------------------------------------------------------
+RUN git clone --depth 1 --recurse-submodules https://github.com/YosysHQ/yosys.git && \
+    cd yosys && \
+    make -j$(nproc) && \
+    make install
+
+# ------------------------------------------------------------
+# 3. nextpnr-ecp5  (place & route)
+# ------------------------------------------------------------
+RUN git clone --depth 1 --recurse-submodules https://github.com/YosysHQ/nextpnr.git && \
+    cd nextpnr && \
+    mkdir build && cd build && \
     cmake \
-    python3 python3-pip python3-setuptools python3-wheel \
-    python3-venv \
-    && rm -rf /var/lib/apt/lists/*
+        -DARCH=ecp5 \
+        -DTRELLIS_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DBUILD_GUI=OFF \
+        .. && \
+    make -j$(nproc) && \
+    make install
 
-# Fetch only the install script
-WORKDIR /opt/ulx3s-toolchain
-RUN wget https://raw.githubusercontent.com/ulx3s/ulx3s-toolchain/master/install.sh && \
-    chmod +x install.sh
+# ------------------------------------------------------------
+# 4. openFPGALoader  (bitstream programming via USB)
+# ------------------------------------------------------------
+RUN git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git && \
+    cd openFPGALoader && \
+    mkdir build && cd build && \
+    cmake -DCMAKE_INSTALL_PREFIX=/usr/local .. && \
+    make -j$(nproc) && \
+    make install
 
-# Run the install script
-RUN ./install.sh aptget barebones
+# ------------------------------------------------------------
+# 5. Verilator  (simulation)
+# ------------------------------------------------------------
+RUN git clone --depth 1 https://github.com/verilator/verilator.git && \
+    cd verilator && \
+    autoconf && \
+    ./configure --prefix=/usr/local && \
+    make -j$(nproc) && \
+    make install
 
-RUN export WORKSPACE=~/ULX3S_workspace && \
-    cd "$WORKSPACE"/ulx3s-toolchain && \
-    ./install_litex.sh && \
-    ./install_litex-ulx3s.sh && \
-    ./install_esp32.sh
+# ------------------------------------------------------------
+# USB / udev rules for ULX3S (FT231X chip, VID 0403 PID 6015)
+# These rules are copied into the image for reference; to take
+# effect on the HOST, copy them from the container:
+#   docker cp <container>:/etc/udev/rules.d/80-ulx3s.rules \
+#             /etc/udev/rules.d/ && udevadm control --reload
+# ------------------------------------------------------------
+RUN echo 'SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", MODE="664", GROUP="dialout"' \
+        > /etc/udev/rules.d/80-ulx3s.rules && \
+    echo 'ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", GROUP="dialout", MODE="666"' \
+        >> /etc/udev/rules.d/80-ulx3s.rules
 
-# Add toolchain to PATH (in case install.sh puts binaries under /usr/local/bin)
-ENV PATH="/usr/local/bin:$PATH"
+# ------------------------------------------------------------
+# 6. ESP-IDF  (ESP32 firmware toolchain)
+#    Pinned to a stable release; change the tag as needed.
+# ------------------------------------------------------------
+ENV IDF_PATH=/opt/esp/idf
+ENV IDF_TOOLS_PATH=/opt/esp/tools
 
-# Default workspace
+RUN mkdir -p /opt/esp && \
+    git clone --depth 1 --branch v5.2.3 --recurse-submodules \
+        https://github.com/espressif/esp-idf.git ${IDF_PATH} && \
+    ${IDF_PATH}/install.sh esp32 && \
+    # Make the IDF environment available in every shell
+    echo "source ${IDF_PATH}/export.sh" >> /etc/bash.bashrc
+
+# esptool is also installed standalone for quick flashing
+RUN pip3 install esptool
+
+# ------------------------------------------------------------
+# 7. ULX3S passthru bitstream
+#    The FPGA must be loaded with this before programming the
+#    ESP32 — it bridges the USB-serial port through to the ESP32.
+# ------------------------------------------------------------
+RUN mkdir -p /opt/ulx3s && \
+    wget -O /opt/ulx3s/passthru_ulx3s_v20_12k.bit \
+        https://github.com/emard/ulx3s-bin/raw/master/fpga/passthru/passthru-v20-12f/passthru_ulx3s_v20_12k.bit && \
+    test -s /opt/ulx3s/passthru_ulx3s_v20_12k.bit
+
+# ------------------------------------------------------------
+# 8. ULX3S self-test bitstream
+# ------------------------------------------------------------
+RUN wget -O /opt/ulx3s/selftest-mcp7940n.bin \
+    https://github.com/emard/ulx3s-bin/raw/master/fpga/f32c/f32c-bin/selftest-mcp7940n.bin && \
+    test -s /opt/ulx3s/selftest-mcp7940n.bin
+
+# Convenience script: flash passthru then program ESP32
+RUN cat <<'EOF' > /usr/local/bin/esp32-flash
+#!/bin/bash
+# Usage: esp32-flash <firmware.bin> [port]
+set -e
+PORT="${2:-/dev/ttyUSB0}"
+BITSTREAM="/opt/ulx3s/passthru_ulx3s_v20_12k.bit"
+echo ">>> Loading passthru bitstream onto FPGA..."
+openFPGALoader -b ulx3s "$BITSTREAM"
+sleep 1
+echo ">>> Flashing ESP32 firmware: $1"
+esptool.py --port "$PORT" --baud 921600 \
+    --before default_reset --after hard_reset \
+    write_flash -z 0x1000 "$1"
+echo ">>> Done!"
+EOF
+RUN chmod +x /usr/local/bin/esp32-flash
+
+# ------------------------------------------------------------
+# Clean up build artefacts
+# ------------------------------------------------------------
+RUN rm -rf /build
+
+# ------------------------------------------------------------
+# Default working directory for user projects
+# ------------------------------------------------------------
 WORKDIR /workspace
+
+# Smoke-test: print versions of all key tools
+RUN echo "=== Toolchain versions ===" && \
+    yosys --version && \
+    nextpnr-ecp5 --version && \
+    openFPGALoader --Version && \
+    verilator --version && \
+    esptool.py version
+
 CMD ["/bin/bash"]
