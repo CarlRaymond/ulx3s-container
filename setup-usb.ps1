@@ -113,5 +113,5 @@ if ($Rebind -and $isBound) {
 usbipd bind --busid $busid
 if ($LASTEXITCODE -ne 0) { Write-Error "Failed to bind device $busid."; exit 1 }
 
-Start-Sleep -Milliseconds 500   # let stub driver settle
+Start-Sleep -Milliseconds 2000  # let stub driver settle
 Write-Host "Device $busid bound successfully."
