@@ -145,9 +145,52 @@ RUN cat <<'EOF' > /usr/local/bin/esp32-flash
 set -e
 PORT="${2:-/dev/ttyUSB0}"
 BITSTREAM="/opt/ulx3s/passthru_ulx3s_v20_12k.bit"
+
 echo ">>> Loading passthru bitstream onto FPGA..."
 openFPGALoader -b ulx3s "$BITSTREAM"
-sleep 1
+
+# After openFPGALoader, the FT231X is in bit-bang mode. A USB reset puts
+# it back to default UART mode and triggers ftdi_sio to auto-bind.
+# Docker's /dev is isolated so we also need to create the device node.
+python3 - <<'PYEOF'
+import fcntl, glob, os, time
+
+# Find FTDI device
+for idv in glob.glob('/sys/bus/usb/devices/*/idVendor'):
+    if open(idv).read().strip() != '0403': continue
+    devdir = os.path.dirname(idv)
+    if open(os.path.join(devdir, 'idProduct')).read().strip() != '6015': continue
+    bus = int(open(os.path.join(devdir, 'busnum')).read())
+    dev = int(open(os.path.join(devdir, 'devnum')).read())
+    path = '/dev/bus/usb/%03d/%03d' % (bus, dev)
+    with open(path, 'wb') as f:
+        fcntl.ioctl(f, 0x5514, 0)   # USBDEVFS_RESET
+    print('USB reset sent to', path)
+    break
+
+# Wait for reenumeration and ftdi_sio to auto-bind
+time.sleep(2)
+
+# Find the ttyUSB device from sysfs and create its node in Docker's /dev
+for tty in glob.glob('/sys/class/tty/ttyUSB*'):
+    dev_str = open(os.path.join(tty, 'dev')).read().strip()
+    major, minor = (int(x) for x in dev_str.split(':'))
+    name = '/dev/' + os.path.basename(tty)
+    if not os.path.exists(name):
+        os.mknod(name, 0o666 | 0o020000, os.makedev(major, minor))
+        print('Created', name)
+PYEOF
+echo ">>> Waiting for $PORT..."
+for i in $(seq 1 10); do
+    [ -e "$PORT" ] && break
+    sleep 1
+done
+if [ ! -e "$PORT" ]; then
+    echo "Error: $PORT did not appear. Available ports:"
+    ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null || echo "  (none)"
+    exit 1
+fi
+
 echo ">>> Flashing ESP32 firmware: $1"
 esptool.py --port "$PORT" --baud 921600 \
     --before default_reset --after hard_reset \
